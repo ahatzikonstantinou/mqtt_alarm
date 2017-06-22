@@ -205,30 +205,3 @@ class MqttAlarm( object ):
 
 if( __name__ == '__main__' ):
     alarm = MqttAlarm( 15, 25, '9497', 'Alarm', MqttParams( "192.168.1.79", "1883", "A/4/A/set", "A/4/A/status" ) )
-    
-'''
-def on_connect(client, userdata, flags, rc):
-    m = "Connected flags"+str(flags)+"result code " + str(rc)+"client1_id  "+str(client)
-    print(m)
-
-def on_message(client1, userdata, message):
-    print("message received  "  ,str(message.payload.decode("utf-8")))
-
-broker_address="192.168.1.79"
-broker_port="1883"
-
-client1 = mqtt.Client("Alarm")    #create new instance
-client1.on_connect= on_connect        #attach function to callback
-client1.on_message=on_message        #attach function to callback
-time.sleep(1)
-client1.connect( broker_address, broker_port )      #connect to broker
-client1.loop_start()    #start the loop
-client1.subscribe( "A/4/A/set" )
-client1.publish( "A/4/A/status", '{"main": "UNARMED", "countdown": 0 }' )
-for i in range( 25, 0, -1 ):
-    client1.publish( "A/4/A/status", '{"main": "ARMING", "countdown": ' + str(i) + ' }' ) #json string must be enclosed in double quotes
-    time.sleep(1)
-client1.publish( "A/4/A/status", '{"main": "ARMED_AWAY", "countdown": 0 }' )
-client1.disconnect()
-client1.loop_stop()
-'''
