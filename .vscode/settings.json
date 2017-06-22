@@ -1,0 +1,6 @@
+// Place your settings in this file to overwrite default and user settings.
+{
+    "git.ignoreLimitWarning": true,
+    "workbench.editor.enablePreview": false,
+    "editor.fontSize": 12
+}
