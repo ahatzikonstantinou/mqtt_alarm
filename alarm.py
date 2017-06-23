@@ -146,7 +146,7 @@ class MqttAlarm( object ):
         """Executed when an mqtt arrives
         """
         text = message.payload.decode( "utf-8" )
-        print( 'Received message {}'.format( text ) )
+        print( 'Received message "{}"'.format( text ) )
         if( mqtt.topic_matches_sub( self.mqttParams.subscribeTopic, message.topic ) ):
             if( text.find( AlarmCommand.ARM_HOME.name ) > -1 ):
                 self.__arm( Status( StatusMain.ARMED_HOME ) )
@@ -264,7 +264,12 @@ class MqttAlarm( object ):
     def __deactivate( self, text ):
         print( 'Attempt to deactivate with text: "{}"'.format( text ) )
         if( self.status.main not in [ StatusMain.TRIGGERED, StatusMain.ACTIVATED ] ):
+            print( 'Current status {}. Will not attempt deactivation.'.format( self.status.main.name ) )
             return
+        if( self.modPin is None or len( self.modPin ) == 0 ):
+            print( 'self.modPin is empty. The DEACTIVATE cmd has probably not been preceded by a DEACTIVATE_REQUEST. Will not attempt deactivation.')
+            return
+            
         response = None
         try:
             response = json.loads( text )
@@ -276,8 +281,7 @@ class MqttAlarm( object ):
             print( 'pin not found in text {}. Will not deactivate'.format( text ) )
             return
         pin = response['pin']
-        for i in range( 4 ):
-            
+        for i in range( 4 ):            
             if( not pin[i].isdigit() ):
                 print( '{} is not a digit, deactivate exits'.format( text[i] ) )
                 return
