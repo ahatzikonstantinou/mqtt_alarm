@@ -35,6 +35,7 @@ class StatusMain( Enum ):
         TRIGGERED:  an event has triggered the alarm and is counting down until it gets ACTIVATED
         ACTIVATED:  sirens screaming, lights flashing, sending sms/email/IM messages, making alert phone calls etc
     """
+    UNAVAILABLE = 0
     UNARMED = 1
     ARMING = 2
     ARMED_HOME = 3
@@ -105,7 +106,7 @@ class MqttAlarm( object ):
         self.triggeredCountdown = triggeredCountdown
         self.mqttId = mqttId
         self.disarmPin = disarmPin
-        self.modPin = ''
+        self.sendPin = ''
         self.triggersArmedAway = triggersArmedAway
         self.triggersArmedHome = triggersArmedHome
         self.armStatus = None   # need to store this in case alarm status cahnges to TRIGGERED or ACTIVATED
@@ -117,6 +118,8 @@ class MqttAlarm( object ):
         self.client = mqtt.Client( self.mqttId )
         self.client.on_connect = self.__on_connect
         self.client.on_message = self.__on_message
+        #set last will and testament before connecting
+        self.client.will_set( self.mqttParams.publishTopic, Status( StatusMain.UNAVAILABLE ).toJson(), qos = 1, retain = True )
         self.client.connect( self.mqttParams.address, self.mqttParams.port )
         self.client.loop_start()
         #go in infinite loop
@@ -140,7 +143,7 @@ class MqttAlarm( object ):
         self.client.subscribe( self.mqttParams.subscribeTopic )
 
         #publish the initial status
-        self.client.publish( self.mqttParams.publishTopic, self.status.toJson() )
+        self.__setStatus( self.status )
 
     def __on_message( self, client, userdata, message ):
         """Executed when an mqtt arrives
@@ -191,7 +194,7 @@ class MqttAlarm( object ):
         if( self.status.main not in [ StatusMain.ARMED_AWAY, StatusMain.ARMED_HOME ] ):
             return
         print( 'Triggered!' )
-        self.__setStatus( Status( StatusMain.TRIGGERED, self.triggeredCountdown ) )
+        self.__setStatus( Status( StatusMain.TRIGGERED, self.triggeredCountdown, self.sendPin ) )
         self.__doTrigger( message )
 
     def __doTrigger( self, message ):
@@ -204,7 +207,7 @@ class MqttAlarm( object ):
         if( self.status.countdown > 0 ):
             threading.Timer(1.0, self.__doTrigger, [message] ).start()
             print( '__doTrigger countdown {} to get to TRIGGERED'.format( self.status.countdown ) )
-            self.__setStatus( Status( StatusMain.TRIGGERED, self.status.countdown -1 ) )
+            self.__setStatus( Status( StatusMain.TRIGGERED, self.status.countdown -1, self.sendPin ) )
         else:
             print( '__doTrigger will set alarm to ACTIVATED because countdown has finished' )
             self.__activate( message )
@@ -250,24 +253,18 @@ class MqttAlarm( object ):
             self.__setStatus( finalArmStatus ) 
 
     def __deactivateRequest( self ):
-        """ Generates a pin and mods with the disarmPin. Sends the result and expects the answer
+        """ Generates a random pin and expects the mod 10 sum (per digit) with the disarmPin. When the answer comes will do the subtraction mod 10 and check against disarmPin
         """
-        sendPin = ''
-        self.modPin = ''
+        self.sendPin = ''
         for i in range( 4 ):
-            r = random.randint( 0, 9 )
-            self.modPin += str( r )
-            sendPin += str( ( r - int( self.disarmPin[i] ) ) % 10 )
-        print( 'disarmPin: {}, modPin:{}, challengePin:{}'.format( self.disarmPin, self.modPin, sendPin ) )
-        self.__setStatus( Status( self.status.main, self.status.countdown, sendPin ) )
+            self.sendPin += str( random.randint( 0, 9 ) )
+        print( 'disarmPin: {}, challengePin:{}'.format( self.disarmPin, self.sendPin ) )
+        self.__setStatus( Status( self.status.main, self.status.countdown, self.sendPin ) )
 
     def __deactivate( self, text ):
         print( 'Attempt to deactivate with text: "{}"'.format( text ) )
         if( self.status.main not in [ StatusMain.TRIGGERED, StatusMain.ACTIVATED ] ):
             print( 'Current status {}. Will not attempt deactivation.'.format( self.status.main.name ) )
-            return
-        if( self.modPin is None or len( self.modPin ) == 0 ):
-            print( 'self.modPin is empty. The DEACTIVATE cmd has probably not been preceded by a DEACTIVATE_REQUEST. Will not attempt deactivation.')
             return
             
         response = None
@@ -286,12 +283,12 @@ class MqttAlarm( object ):
                 print( '{} is not a digit, deactivate exits'.format( text[i] ) )
                 return
 
-            if( pin[i] != self.modPin[i] ):
+            if( str( ( int( pin[i] ) - int( self.sendPin[i] ) )%10 ) != self.disarmPin[i] ):
                 print( 'Wrong pin! Will not deactivate' )
                 return
             
-        print( 'pin:{} == modPin:{}. Will deactivate '.format( text, self.modPin ) )
-        self.modPin = ''
+        print( 'pin:{} == disarmPin:{}. Will deactivate '.format( text, self.disarmPin ) )
+        self.sendPin = ''
         self.__setStatus( Status( StatusMain.UNARMED ) )
 
     def __disarm( self ):
@@ -312,7 +309,7 @@ class MqttAlarm( object ):
 
     def __setStatus( self, status ):
         self.status = status
-        self.client.publish( self.mqttParams.publishTopic, self.status.toJson() )
+        self.client.publish( self.mqttParams.publishTopic, self.status.toJson(), qos = 2, retain = True )
 
 if( __name__ == '__main__' ):
     configurationFile = 'alarm.conf'
