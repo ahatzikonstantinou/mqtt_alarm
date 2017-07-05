@@ -80,6 +80,29 @@ class AlarmCommand( Enum ):
     DEACTIVATE = 4
     DISARM = 5
 
+
+class EmailConfig( object ):
+    def __init__( self, sender, recipients, subject ):
+        self.sender = sender
+        self.subject = subject
+        self.recipients = recipients
+
+class Notify( object ):
+    def __init__( self, sms = [], phonecall = [], im = [], email = [] ):
+        self.sms = sms
+        self.phonecall = phonecall
+        self.im = im
+        self.email = email
+    
+    def toMqttCommand( self, messageText ):
+        return json.dumps( { 
+            'sms': SMS( self.sms, messageText  ), 
+            'phonecall': self.phonecall, 
+            'im': InstantMessage( self.im, messageText )
+            'email': Email( self.email.sender,  self.email.recipients, self.email.subject, messageText )
+        } )
+        
+
 class Trigger( object ):
     """ Definition of how to detect trigger events. When armed the alarm will subscribe to certain mqtt topics..
         When such a message arrives and the corresponding regex matches, the alarm will trigger
@@ -88,17 +111,34 @@ class Trigger( object ):
         topics: list of topics to subscibe and listen for incoming messages
         regex: a regeular expression to be matched against the payload of the received message. If matched the alarm triggers
     """
-    def __init__( self, topics, regex ):
+    def __init__( self, topics, regex, notify ):
         self.topics = topics
         self.regex = regex
+        self.notify = notify
+
+class MqttPublish( object ):
+    """ This class holds the configuration for a publish command to be executed when starting or stopping an arm state """
+    def __init__( self, topic, command ):
+         self.topic = topic
+         self.command = command
+
+class ArmConfig( object ):
+    """ This class holds the configuration for an arm state such as arm_home and arm_away, as it is loaded from configuration file """
+    def __init__( self, start, stop, triggers ):
+        """ 
+            start: the mqtt publish messages to send e.g. mqtt motion sensor activate
+            stop: the mqtt publish messages to send e.g. mqtt motion sensor deactivate
+            triggers: objects holding the description of what will trigger the alarm and what will happen
+        """
+        self.start = start
+        self.stop = stop
+        self.triggers = triggers
 
 class MqttAlarm( object ):
     """ An alarm that publishes its status using mqtt and receives commands the same way
     """
 
-    #these are the only commands that may be sent over mqtt
-
-    def __init__( self, armingCountdown, triggeredCountdown, disarmPin, mqttId, mqttParams, triggersArmedAway, triggersArmedHome, status = Status( StatusMain.UNARMED, 0 ) ):
+    def __init__( self, armingCountdown, triggeredCountdown, disarmPin, mqttId, mqttParams, armedAway, armedHome, notifier, status = Status( StatusMain.UNARMED, 0 ) ):
         self.status = status
         self.countdown = 0
         self.mqttParams = mqttParams
@@ -107,9 +147,10 @@ class MqttAlarm( object ):
         self.mqttId = mqttId
         self.disarmPin = disarmPin
         self.sendPin = ''
-        self.triggersArmedAway = triggersArmedAway
-        self.triggersArmedHome = triggersArmedHome
-        self.armStatus = None   # need to store this in case alarm status cahnges to TRIGGERED or ACTIVATED
+        self.armedAway = armedAway
+        self.armedHome = armedHome
+        self.notifier = notifier
+        self.armStatus = None   # need to store this in case alarm status changes to TRIGGERED or ACTIVATED
 
         signal.signal( signal.SIGINT, self.__signalHandler )
         
@@ -168,14 +209,14 @@ class MqttAlarm( object ):
             if( self.status.main in [ StatusMain.ARMED_AWAY, StatusMain.ARMED_HOME ] ):
                 triggers = []
                 if( StatusMain.ARMED_AWAY == self.armStatus ):
-                    triggers = self.triggersArmedAway
+                    triggers = self.armedAway.triggers
                 elif( StatusMain.ARMED_HOME == self.armStatus ):
-                    triggers = self.triggersArmedHome
+                    triggers = self.armedHome.triggers
                 for t in triggers:
                     for o in t.topics: 
                         if( mqtt.topic_matches_sub( o, message.topic ) and re.search( t.regex, text ) is not None ):
                             self.__logTrigger( message )
-                            self.__trigger( message )                            
+                            self.__trigger( message, t.notify )                            
             elif( self.status.main in [ StatusMain.ACTIVATED, StatusMain.TRIGGERED ] ):
                 #when already activated or triggered just log the trigger event
                 self.__logTrigger( message )
@@ -183,21 +224,23 @@ class MqttAlarm( object ):
     def __logActivation( self, message ):
         print( 'Alarm was ACTIVATED at [{}] by message <{}> "{}"'.format( datetime.now(), message.topic, message.payload.decode( "utf-8" ) ) )
     
-    def __activate( self, message ):
+    def __activate( self, message, notify ):
         self.__logActivation( message )
         self.__setStatus( Status( StatusMain.ACTIVATED ) )
+        self.client.publish( self.notifier, notify.toMqttCommand( message.payload.decode( "utf-8" ) ), qos = 2, retain = True )
+
 
     def __logTrigger( self, message ):
         print( 'Alarm was triggered at [{}] by message <{}> "{}"'.format( datetime.now(), message.topic, message.payload.decode( "utf-8" ) ) )
 
-    def __trigger( self, message ):
+    def __trigger( self, message, notify ):
         if( self.status.main not in [ StatusMain.ARMED_AWAY, StatusMain.ARMED_HOME ] ):
             return
         print( 'Triggered!' )
         self.__setStatus( Status( StatusMain.TRIGGERED, self.triggeredCountdown, self.sendPin ) )
-        self.__doTrigger( message )
+        self.__doTrigger( message, notify )
 
-    def __doTrigger( self, message ):
+    def __doTrigger( self, message, notify ):
         """Will activate when triggerCountdown is finished
         """
         if( StatusMain.TRIGGERED != self.status.main ):
@@ -205,12 +248,12 @@ class MqttAlarm( object ):
             return
         
         if( self.status.countdown > 0 ):
-            threading.Timer(1.0, self.__doTrigger, [message] ).start()
+            threading.Timer(1.0, self.__doTrigger, [message, notify] ).start()
             print( '__doTrigger countdown {} to get to TRIGGERED'.format( self.status.countdown ) )
             self.__setStatus( Status( StatusMain.TRIGGERED, self.status.countdown -1, self.sendPin ) )
         else:
             print( '__doTrigger will set alarm to ACTIVATED because countdown has finished' )
-            self.__activate( message )
+            self.__activate( message, notify )
     
     def __arm( self, finalArmStatus ):
         """ Sets the status to arming and calls __doArm with the finalStatus
@@ -239,14 +282,19 @@ class MqttAlarm( object ):
 
             #subscribe to trigger topics
             triggers = []
+            mqttPublish = []
             if( StatusMain.ARMED_AWAY == finalArmStatus.main ):
-                triggers = self.triggersArmedAway
+                triggers = self.armedAway.triggers
+                mqttPublish = self.armedAway.start
             elif( StatusMain.ARMED_HOME == finalArmStatus.main ):
-                triggers = self.triggersArmedHome
+                triggers = self.armedHome.triggers
+                mqttPublish = self.armedHome.start
             for t in triggers:
                 for o in t.topics:                    
                     print( '\tsubscribing to trigger topic: {}', o )
                     self.client.subscribe( o )  #subscribe to trigger topics
+            for p in mqttPublish:
+                self.client.publish( p.topic, p.command, qos = 2, retain = True )
 
             # set and publish new status
             self.armStatus = finalArmStatus.main
@@ -289,20 +337,28 @@ class MqttAlarm( object ):
             
         print( 'pin:{} == disarmPin:{}. Will deactivate '.format( text, self.disarmPin ) )
         self.sendPin = ''
-        self.__setStatus( Status( StatusMain.UNARMED ) )
+        self.__doDisarm()
 
     def __disarm( self ):
         if( StatusMain.ARMED_AWAY == self.status.main or StatusMain.ARMED_HOME == self.status.main or StatusMain.ARMING == self.status.main ):
+            self.__doDisarm()
+
+    def __doDisarm( self ):
             print( 'Disarm will unsubscribe from trigger topics' )
             triggers = []
+            mqttPublish = []
             if( StatusMain.ARMED_AWAY == self.status.main ):
-                triggers = self.triggersArmedAway
+                triggers = self.armedAway.triggers
+                mqttPublish = self.armedAway.stop
             elif( StatusMain.ARMED_HOME == self.status.main ):
-                triggers = self.triggersArmedHome
+                triggers = self.armedHome.triggers
+                mqttPublish = self.armedHome.stop
             for t in triggers:
                 for o in t.topics:                    
                     print( '\tunsubscribing from trigger topic: {}', o )
                     self.client.unsubscribe( o )
+            for p in mqttPublish:
+                self.client.publish( p.topic, p.command, qos = 2, retain = True )
 
             self.armStatus = StatusMain.UNARMED
             self.__setStatus( Status( StatusMain.UNARMED ) )
@@ -328,9 +384,37 @@ if( __name__ == '__main__' ):
             configuration['disarmPin'], 
             configuration['mqttId'], 
             MqttParams( configuration['mqttParams']['address'], int( configuration['mqttParams']['port'] ), configuration['mqttParams']['subscribeTopic'], configuration['mqttParams']['publishTopic'] ),
-            [ Trigger( x['topics'], x['regex'] ) for x in configuration['triggers']['armedAway'] ],
-            [ Trigger( x['topics'], x['regex'] ) for x in configuration['triggers']['armedHome'] ],
+            ArmConfig( 
+                [ MqttPublish( x['topic'], x['command'] ) for x in configuration['armedAway']['start'] ],
+                [ MqttPublish( x['topic'], x['command'] ) for x in configuration['armedAway']['stop'] ],
+                [ Trigger( 
+                    x['topics'], 
+                    x['regex'], 
+                    Notify( 
+                        x['notify']['sms'], 
+                        x['notify']['phonecall'], 
+                        x['notify']['im'], 
+                        EmailConfig( x['notify']['email']['from'], x['notify']['email']['to'], x['notify']['email']['subject']  )
+                    )
+                    for x in configuration['armedAway']['triggers'] 
+                ]
+            ),
+            ArmConfig( 
+                [ MqttPublish( x['topic'], x['command'] ) for x in configuration['armedHome']['start'] ],
+                [ MqttPublish( x['topic'], x['command'] ) for x in configuration['armedHome']['stop'] ],
+                [ Trigger( 
+                    x['topics'], 
+                    x['regex'], 
+                    Notify( 
+                        x['notify']['sms'], 
+                        x['notify']['phonecall'], 
+                        x['notify']['im'], 
+                        EmailConfig( x['notify']['email']['from'], x['notify']['email']['to'], x['notify']['email']['subject']  )
+                    )
+                    for x in configuration['armedHome']['triggers'] 
+                ]
+            ),
+            configuration['notifier'],
             Status( StatusMain[ configuration['status']['main'] ], configuration['status']['countdown'] )
-
         )
         alarm.run()
