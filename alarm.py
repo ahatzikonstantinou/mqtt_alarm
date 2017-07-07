@@ -8,10 +8,16 @@ import signal   #to detect CTRL C
 import sys
 
 import json #to generate payloads for mqtt publishing
+import jsonpickle #json.dumps crashes for InstantMessage. jsonpickle works fine
 import random #for the disarm pin
 import threading    #for timing the countdowns
 import os.path # to check if configuration file exists
 import re # regular expression to detect trigger events
+import requests # for translation
+
+sys.path.append( os.path.abspath('../mqtt_notifier' ) )
+from aux import *
+from gsm import SMS
 
 from pprint import pprint #for debug printing
 
@@ -87,19 +93,47 @@ class EmailConfig( object ):
         self.subject = subject
         self.recipients = recipients
 
+class Notification( object ):
+    def __init__( self, notifierMqttPublish, messageTemplate, translationUrl ):
+        self.notifierMqttPublish = notifierMqttPublish
+        self.messageTemplate = messageTemplate
+        self.translationUrl = translationUrl
+
+    def generateMessage( self, mqttMessage ):
+        translation = None
+        message = self.messageTemplate
+        try:
+            response = requests.get( self.translationUrl + mqttMessage.topic )
+            translation = response.json()
+            # print( 'received translation: ', json.dumps( translation, indent = 2 ).decode('utf-8') )
+            device_name = ( translation['house'] + '/' + translation['floor'] + '/' + translation['room'] + '/' + translation['item'] ).encode('utf-8')
+            # print( 'device_name: ', device_name.decode('utf-8') )
+            # print( 'messsage: ', message )
+            message = message.replace( '{device_name}', device_name.decode('utf-8') ).encode('utf-8')
+            # print( 'payload: {}'.format( mqttMessage.payload.decode( "utf-8" ) ) )
+            # print( 'now message: {}'.format( message ) )
+            message = message.decode('utf-8').replace( '{text}', mqttMessage.payload.decode( "utf-8" ) ).encode('utf-8')
+        except Exception as e:
+            print( 'error: ', e.message, e.args )
+            pass
+        print( 'returning message: {}'.format( message ).decode('utf-8') )
+        return message
+
+
 class Notify( object ):
-    def __init__( self, sms = [], phonecall = [], im = [], email = [] ):
+    def __init__( self, sms = [], phonecall = [], im = [], email = None ):
         self.sms = sms
         self.phonecall = phonecall
         self.im = im
         self.email = email
     
     def toMqttCommand( self, messageText ):
-        return json.dumps( { 
+        print( 'messageText: {}, sms: {}, phonecall: {}, im: {}, email: {}'.format( messageText, self.sms, self.phonecall, self.im, self.email ) )
+        return jsonpickle.encode( { 
             'sms': SMS( self.sms, messageText  ), 
             'phonecall': self.phonecall, 
-            'im': InstantMessage( self.im, messageText )
-            'email': Email( self.email.sender,  self.email.recipients, self.email.subject, messageText )
+            'im': InstantMessage( self.im, messageText ),
+            'email': None if self.email is None else Email( self.email.sender,  self.email.recipients, self.email.subject, messageText )
         } )
         
 
@@ -138,7 +172,7 @@ class MqttAlarm( object ):
     """ An alarm that publishes its status using mqtt and receives commands the same way
     """
 
-    def __init__( self, armingCountdown, triggeredCountdown, disarmPin, mqttId, mqttParams, armedAway, armedHome, notifier, status = Status( StatusMain.UNARMED, 0 ) ):
+    def __init__( self, armingCountdown, triggeredCountdown, disarmPin, mqttId, mqttParams, armedAway, armedHome, notification, status = Status( StatusMain.UNARMED, 0 ) ):
         self.status = status
         self.countdown = 0
         self.mqttParams = mqttParams
@@ -149,7 +183,7 @@ class MqttAlarm( object ):
         self.sendPin = ''
         self.armedAway = armedAway
         self.armedHome = armedHome
-        self.notifier = notifier
+        self.notification = notification
         self.armStatus = None   # need to store this in case alarm status changes to TRIGGERED or ACTIVATED
 
         signal.signal( signal.SIGINT, self.__signalHandler )
@@ -227,8 +261,7 @@ class MqttAlarm( object ):
     def __activate( self, message, notify ):
         self.__logActivation( message )
         self.__setStatus( Status( StatusMain.ACTIVATED ) )
-        self.client.publish( self.notifier, notify.toMqttCommand( message.payload.decode( "utf-8" ) ), qos = 2, retain = True )
-
+        self.client.publish( self.notification.notifierMqttPublish, notify.toMqttCommand( self.notification.generateMessage( message ) ), qos = 2, retain = True )
 
     def __logTrigger( self, message ):
         print( 'Alarm was triggered at [{}] by message <{}> "{}"'.format( datetime.now(), message.topic, message.payload.decode( "utf-8" ) ) )
@@ -387,34 +420,38 @@ if( __name__ == '__main__' ):
             ArmConfig( 
                 [ MqttPublish( x['topic'], x['command'] ) for x in configuration['armedAway']['start'] ],
                 [ MqttPublish( x['topic'], x['command'] ) for x in configuration['armedAway']['stop'] ],
-                [ Trigger( 
-                    x['topics'], 
-                    x['regex'], 
-                    Notify( 
-                        x['notify']['sms'], 
-                        x['notify']['phonecall'], 
-                        x['notify']['im'], 
-                        EmailConfig( x['notify']['email']['from'], x['notify']['email']['to'], x['notify']['email']['subject']  )
+                [ 
+                    Trigger( 
+                        x['topics'], 
+                        x['regex'], 
+                        None if 'notify' not in x else Notify( 
+                            [] if 'sms' not in x['notify'] else x['notify']['sms'], 
+                            [] if 'phonecall' not in x['notify'] else x['notify']['phonecall'], 
+                            [] if 'im' not in x['notify'] else x['notify']['im'], 
+                            None if 'email' not in x['notify'] else EmailConfig( x['notify']['email']['from'], x['notify']['email']['to'], x['notify']['email']['subject']  )
+                        )
                     )
-                    for x in configuration['armedAway']['triggers'] 
+                    for x in configuration['armedAway']['triggers']
                 ]
             ),
             ArmConfig( 
                 [ MqttPublish( x['topic'], x['command'] ) for x in configuration['armedHome']['start'] ],
                 [ MqttPublish( x['topic'], x['command'] ) for x in configuration['armedHome']['stop'] ],
-                [ Trigger( 
-                    x['topics'], 
-                    x['regex'], 
-                    Notify( 
-                        x['notify']['sms'], 
-                        x['notify']['phonecall'], 
-                        x['notify']['im'], 
-                        EmailConfig( x['notify']['email']['from'], x['notify']['email']['to'], x['notify']['email']['subject']  )
+                [ 
+                    Trigger( 
+                        x['topics'], 
+                        x['regex'], 
+                        None if 'notify' not in x else Notify( 
+                            [] if 'sms' not in x['notify'] else x['notify']['sms'], 
+                            [] if 'phonecall' not in x['notify'] else x['notify']['phonecall'], 
+                            [] if 'im' not in x['notify'] else x['notify']['im'], 
+                            None if 'email' not in x['notify'] else EmailConfig( x['notify']['email']['from'], x['notify']['email']['to'], x['notify']['email']['subject']  )
+                        )
                     )
                     for x in configuration['armedHome']['triggers'] 
                 ]
             ),
-            configuration['notifier'],
+            Notification( configuration['notification']['notifierMqttPublish'], configuration['notification']['messageTemplate'], configuration['notification']['translationUrl'] ),
             Status( StatusMain[ configuration['status']['main'] ], configuration['status']['countdown'] )
         )
         alarm.run()
